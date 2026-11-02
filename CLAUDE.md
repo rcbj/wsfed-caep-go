@@ -19,9 +19,11 @@ Omitted or `true` means on. The resolved configuration leaves `SignalsSet` false
 
 ## Tests
 
-```sh
-go test ./...
+```bash
+docker build --target test .
 ```
+
+The `test` stage runs `go test ./...` in `golang:1.27-bookworm`. GitHub Actions uses that command. Do not run the Go toolchain on the host. The demo image does not run the suite.
 
 Go covers the stub IdP (a signed SAML assertion the library accepts), replay, metadata, the self-signed certificate, the SSF poll receiver, the setup script's signals behavior, and the demo handler. No live iya-sts. XML signatures use exclusive canonicalization from `github.com/russellhaering/goxmldsig` and an RSA-SHA256 check in this module. This tree does not wrap another WS-Federation relying party.
 

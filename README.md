@@ -22,17 +22,26 @@ who, err := party.HandleReply(wsfed.ReplyRequest{Method: "POST", URL: "/wsfed", 
 `signals` omitted or `true` is on. The resolved configuration omits the key in that case (`SignalsSet` stays false). `false` is kept, does not start a receiver, and does not require transmitter metadata. Sign-in is unchanged either way: WS-Federation does not send OAuth scopes. Any other value raises a config error whose message is `signals must be true or false`.
 
 ```sh
-go run ./cmd/wsfed-caep generate-keys --config demo/wsfed.json
-go run ./cmd/wsfed-caep metadata --config demo/wsfed.json
+docker compose build
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD/demo:/app/demo" \
+  wsfed-caep-go-demo \
+  wsfed-caep generate-keys --config demo/wsfed.json
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD/demo:/app/demo" \
+  wsfed-caep-go-demo \
+  wsfed-caep metadata --config demo/wsfed.json
 ```
 
 The generated certificate's common name defaults to `wsfed-caep-nodejs relying party` plus the realm, cut at 64 characters.
 
 ## Tests
 
-```sh
-go test ./...
+```bash
+docker build --target test .
 ```
+
+The suite runs in a container.
 
 `go test` covers the stub IdP (a signed SAML assertion the library accepts), replay, metadata, the self-signed certificate, the SSF poll receiver, the setup script's signals behavior, and the demo handler. No live iya-sts.
 
