@@ -12,6 +12,11 @@ ADMIN_API_CLIENT_SECRET or STS_ADMIN_API_CLIENT_SECRET and a reachable identity 
 A loopback realm and reply URL follow the port the demo listens on. The container's PORT wins over
 the shell PORT. An explicit --public-url or PUBLIC_URL replaces the origin and keeps the path.
 ``signals: false`` skips Shared Signals registration even when an ssf block is present.
+
+Every run writes iya-sts's listener CA trust chain (leaf, TLS Issuing CA, Intermediate, Root) to the
+file idpCa names (demo default generated/idp-ca.pem), through scripts/trust_chain.py. The demo image
+build copies that file in, so rebuild the image after running this against a different iya-sts.
+A generated test-user password goes to demo/generated/<user>.password (mode 0600), never to stdout.
 """
 
 from __future__ import annotations
@@ -28,6 +33,9 @@ from pathlib import Path
 LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 MULTIPLE_ACCOUNTS = {"key": "authn.multipleAccounts", "value": True}
 ROOT = Path(__file__).resolve().parent.parent
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from trust_chain import save_trust_chain  # noqa: E402
 
 
 def usage() -> str:
@@ -275,6 +283,7 @@ def _request(url: str, method: str = "GET", headers: dict | None = None, body: b
     context = None
     if url.startswith("https"):
         context = ssl.create_default_context()
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         if ca:
             context.load_verify_locations(cadata=ca)
     req = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
@@ -339,8 +348,8 @@ def main(argv: list[str] | None = None) -> None:
     if args["dry_run"]:
         if not Path(files["key"]).exists():
             print(f"# would generate the key pair {files['key']}, {files['cert']}")
-        if files["idp_ca"] and not Path(files["idp_ca"]).exists():
-            print(f"# would save {origin}'s TLS root to {files['idp_ca']}")
+        if files["idp_ca"]:
+            print(f"# would save {origin}'s listener CA trust chain to {files['idp_ca']}")
         print(f"# would write {files['rp_metadata']}")
         for call in plan_for(files, base, args["test_user"]):
             print(f"{call['method']} {call['path']}  # {call['why']}")
@@ -352,13 +361,17 @@ def main(argv: list[str] | None = None) -> None:
         _generate_keys(args["config"])
     ca = None
     if files["idp_ca"]:
-        if not Path(files["idp_ca"]).exists():
-            root = _fetch_tls_root(origin)
-            Path(files["idp_ca"]).parent.mkdir(parents=True, exist_ok=True)
-            Path(files["idp_ca"]).write_text(root, encoding="utf-8")
-            print(f"Saved {origin}'s TLS root to {files['idp_ca']} (trusted on first use).")
-            print("  Compare it with the Root CA on iya-sts's Server configuration, PKI page.")
-        ca = Path(files["idp_ca"]).read_text(encoding="utf-8")
+        try:
+            chain = save_trust_chain(origin, files["idp_ca"])
+        except Exception as error:
+            raise SystemExit(f"could not read {origin}'s listener CA trust chain: {error}") from error
+        ca = chain["pem"]
+        subject = chain["anchor"].subject.rfc4514_string().replace("\n", ", ")
+        print(f"Saved {origin}'s listener CA trust chain ({chain['count']} certificate(s)) to {files['idp_ca']} (trusted on first use)")
+        print(f"  trust anchor {subject}")
+        print(f"  sha256 {chain['fingerprint']}")
+        print("  Compare the anchor with the Root CA on iya-sts's Server configuration, PKI page.")
+        print("  The demo image copies this file in when it is built: rebuild it (docker compose up --build).")
     xml = metadata_for(args["config"], files["realm"], files["reply_url"])
     Path(files["rp_metadata"]).parent.mkdir(parents=True, exist_ok=True)
     Path(files["rp_metadata"]).write_text(xml, encoding="utf-8")
@@ -405,7 +418,7 @@ def main(argv: list[str] | None = None) -> None:
     Path(files["idp_metadata"]).write_text(fetched["body"], encoding="utf-8")
     print(f"Saved the IdP metadata to {files['idp_metadata']}")
     if args["test_user"]:
-        _ensure_user(base, ca, token, args["test_user"], api)
+        _ensure_user(base, ca, token, args["test_user"], api, Path(files["key"]).parent)
     print("Done. Start the demo with: docker compose up --build")
 
 
@@ -420,7 +433,7 @@ def _mint(origin: str, base: str, ca: str | None, secret: str) -> str:
     return reply["body"]["access_token"]
 
 
-def _ensure_user(base: str, ca: str | None, token: str, username: str, api) -> None:
+def _ensure_user(base: str, ca: str | None, token: str, username: str, api, generated: Path) -> None:
     found = _json(f"{base}/admin-api/users?user={urllib.parse.quote(username)}", ca, headers={"accept": "application/json", "authorization": f"Bearer {token}"})
     password = os.environ.get("WSFED_DEMO_USER_PASSWORD") or ""
     if found["body"].get("known") is True and password:
@@ -438,43 +451,15 @@ def _ensure_user(base: str, ca: str | None, token: str, username: str, api) -> N
             raise RuntimeError(f"creating {username} was refused: {json.dumps(made['body'])[:300]}")
         print(f"Created user {username}.")
         if made["body"].get("password"):
-            print(f"Generated password for {username} (shown once): {made['body']['password']}")
-
-
-def _pem_certificate(value) -> str:
-    """PEM for a peer certificate. Newer interpreters return an ssl.Certificate, not DER bytes."""
-    if isinstance(value, str):
-        if "BEGIN CERTIFICATE" not in value:
-            raise RuntimeError("the TLS peer certificate is not PEM")
-        text = value.strip()
-        return text if text.endswith("\n") else text + "\n"
-    if isinstance(value, (bytes, bytearray)):
-        raw = bytes(value)
-        if raw.lstrip().startswith(b"-----BEGIN CERTIFICATE-----"):
-            return raw.decode("ascii")
-        pem_body = __import__("base64").b64encode(raw).decode()
-        lines = [pem_body[i:i + 64] for i in range(0, len(pem_body), 64)]
-        return "-----BEGIN CERTIFICATE-----\n" + "\n".join(lines) + "\n-----END CERTIFICATE-----\n"
-    public_bytes = getattr(value, "public_bytes", None)
-    if public_bytes is None:
-        raise RuntimeError("the TLS peer certificate cannot be encoded")
-    return _pem_certificate(public_bytes())
-
-
-def _fetch_tls_root(origin: str) -> str:
-    import socket
-
-    parsed = urllib.parse.urlsplit(origin)
-    host = parsed.hostname or ""
-    port = parsed.port or 443
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-    with socket.create_connection((host, port), timeout=15) as sock:
-        with context.wrap_socket(sock, server_hostname=host) as tls:
-            chain = getattr(tls._sslobj, "get_unverified_chain", lambda: None)()
-            cert = chain[-1] if chain else tls.getpeercert(True)
-    return _pem_certificate(cert)
+            # Never printed: a password does not belong in a log. It goes to a file only its
+            # owner can read, in demo/generated, which never enters an image (.dockerignore
+            # admits only idpCa's chain).
+            saved = generated / f"{username}.password"
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(saved, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as out:
+                out.write(made["body"]["password"] + "\n")
+            print(f"Generated a password for {username}; it is in {saved} (readable by you only).")
 
 
 if __name__ == "__main__":
