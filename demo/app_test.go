@@ -4,6 +4,7 @@
 package demo
 
 import (
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -99,6 +100,30 @@ func TestSignInCleanupAndLogout(t *testing.T) {
 		t.Fatal(reply.StatusCode, string(msg))
 	}
 	sid := cookieValue(reply, "sid")
+	statusReq, _ := http.NewRequest("GET", base+"/live-status", nil)
+	statusReq.Header.Set("cookie", "sid="+sid)
+	statusRes, err := client.Do(statusReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusBody, _ := io.ReadAll(statusRes.Body)
+	statusRes.Body.Close()
+	if statusRes.StatusCode != 200 || statusRes.Header.Get("cache-control") != "no-store" {
+		t.Fatal(statusRes.StatusCode, statusRes.Header)
+	}
+	var live map[string]any
+	if err := json.Unmarshal(statusBody, &live); err != nil {
+		t.Fatal(err)
+	}
+	if live["signedIn"] != true || live["subject"] != "alice-1234" || live["receiver"] != "not configured" {
+		t.Fatal(string(statusBody))
+	}
+	if events, ok := live["events"].([]any); !ok || len(events) != 0 {
+		t.Fatal(string(statusBody))
+	}
+	if strings.Contains(string(statusBody), "Assertion") || strings.Contains(string(statusBody), "wresult") {
+		t.Fatal(string(statusBody))
+	}
 	homeReq, _ := http.NewRequest("GET", base+"/", nil)
 	homeReq.Header.Set("cookie", "sid="+sid)
 	home, err := client.Do(homeReq)
@@ -150,6 +175,74 @@ func TestSignInCleanupAndLogout(t *testing.T) {
 	refused.Body.Close()
 	if refused.StatusCode != 400 {
 		t.Fatal(refused.StatusCode)
+	}
+}
+
+func TestLiveStatusRecordsEventsAndSessionRevokedEndsTheOneSession(t *testing.T) {
+	rp, err := wsfed.Create(map[string]any{
+		"realm": "https://rp.test/", "replyUrl": "https://rp.test/wsfed",
+		"privateKey": stubidp.RPKey, "certificate": stubidp.RPCert,
+		"idpMetadata": stubidp.IdPMetadata(nil),
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := New(rp, nil)
+	_, fields, _ := app.Handle("GET", "/login", map[string]string{}, nil)
+	var location, pending string
+	for _, field := range fields {
+		if field.Name == "location" {
+			location = field.Value
+		}
+		if field.Name == "set-cookie" && strings.HasPrefix(field.Value, "wsfed_pending=") {
+			pending = strings.TrimPrefix(strings.Split(field.Value, ";")[0], "wsfed_pending=")
+		}
+	}
+	parsed, _ := url.Parse(location)
+	made, err := stubidp.SignedAssertion(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := stubidp.WResult(&stubidp.WResultOptions{Token: &made.XML})
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{"wa": {"wsignin1.0"}, "wresult": {result}, "wctx": {parsed.Query().Get("wctx")}}
+	status, fields, msg := app.Handle("POST", "/wsfed", map[string]string{"cookie": "wsfed_pending=" + pending}, []byte(form.Encode()))
+	if status != 303 {
+		t.Fatal(status, string(msg))
+	}
+	var sid string
+	for _, field := range fields {
+		if field.Name == "set-cookie" && strings.HasPrefix(field.Value, "sid=") {
+			sid = strings.TrimPrefix(strings.Split(field.Value, ";")[0], "sid=")
+		}
+	}
+	live := func() map[string]any {
+		_, _, body := app.Handle("GET", "/live-status", map[string]string{"cookie": "sid=" + sid}, nil)
+		var out map[string]any
+		if err := json.Unmarshal(body, &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	app.Remember(&wsfed.SignalEvent{Type: wsfed.Event["credential_change"], JTI: "jti-1"})
+	got := live()
+	if got["signedIn"] != true {
+		t.Fatal(got)
+	}
+	events := got["events"].([]any)
+	if len(events) != 1 || events[0].(map[string]any)["type"] != wsfed.Event["credential_change"] || events[0].(map[string]any)["jti"] != "jti-1" {
+		t.Fatal(got)
+	}
+	app.Remember(&wsfed.SignalEvent{Type: wsfed.Event["session_revoked"], JTI: "jti-2"})
+	got = live()
+	if got["signedIn"] != false || got["subject"] != nil {
+		t.Fatal(got)
+	}
+	events = got["events"].([]any)
+	if len(events) != 2 || events[1].(map[string]any)["type"] != wsfed.Event["session_revoked"] || events[1].(map[string]any)["jti"] != "jti-2" {
+		t.Fatal(got)
 	}
 }
 

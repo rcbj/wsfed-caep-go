@@ -21,6 +21,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/rcbj/wsfed-caep-go/wsfed"
 )
@@ -34,14 +35,19 @@ func init() {
 	gifBytes, _ = base64.StdEncoding.DecodeString("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
 }
 
-// App is the request handler the example and the tests share.
+// App is the request handler the example and the tests share. GET /live-status is JSON:
+// signedIn, subject, receiver, and the accepted Shared Signals events (type and jti). It never
+// includes tokens or assertions.
 type App struct {
-	RP        *wsfed.RelyingParty
-	Receiver  *wsfed.SignalsReceiver
-	sessions  map[string]*wsfed.Login
-	secret    []byte
-	replyPath string
-	secure    string
+	RP            *wsfed.RelyingParty
+	Receiver      *wsfed.SignalsReceiver
+	mu            sync.Mutex
+	sessions      map[string]*wsfed.Login
+	events        [][2]string
+	receiverState string
+	secret        []byte
+	replyPath     string
+	secure        string
 }
 
 func New(rp *wsfed.RelyingParty, receiver *wsfed.SignalsReceiver) *App {
@@ -56,7 +62,7 @@ func New(rp *wsfed.RelyingParty, receiver *wsfed.SignalsReceiver) *App {
 	if reply != nil && reply.Scheme == "https" {
 		secure = "; Secure"
 	}
-	return &App{RP: rp, Receiver: receiver, sessions: map[string]*wsfed.Login{}, secret: secret, replyPath: path, secure: secure}
+	return &App{RP: rp, Receiver: receiver, sessions: map[string]*wsfed.Login{}, receiverState: "not configured", secret: secret, replyPath: path, secure: secure}
 }
 
 func sign(secret []byte, value string) string {
@@ -103,7 +109,73 @@ type header struct {
 }
 
 // Drop forgets a local session, for example when a signal ends it.
-func (a *App) Drop(id string) { delete(a.sessions, id) }
+func (a *App) Drop(id string) {
+	a.mu.Lock()
+	delete(a.sessions, id)
+	a.mu.Unlock()
+}
+
+func (a *App) session(id string) *wsfed.Login {
+	if id == "" {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sessions[id]
+}
+
+// SetReceiverState is what GET /live-status reports as receiver.
+func (a *App) SetReceiverState(state string) {
+	a.mu.Lock()
+	a.receiverState = state
+	a.mu.Unlock()
+}
+
+// Remember records an accepted Shared Signals event for GET /live-status.
+func (a *App) Remember(event *wsfed.SignalEvent) {
+	a.mu.Lock()
+	a.events = append(a.events, [2]string{event.Type, event.JTI})
+	// iya-sts main sets the WS-Federation assertion's SessionIndex to the
+	// assertion id. The CAEP session-revoked subject names the sign-on
+	// session instead, so the index finds nobody and the end callback is not
+	// asked to drop this login. This demo has that one session.
+	var ids []string
+	if event.Type == wsfed.Event["session_revoked"] && len(event.Sessions) == 0 {
+		for id := range a.sessions {
+			ids = append(ids, id)
+		}
+		a.sessions = map[string]*wsfed.Login{}
+	}
+	receiver := a.Receiver
+	a.mu.Unlock()
+	if receiver != nil {
+		for _, id := range ids {
+			receiver.Untrack(id)
+		}
+	}
+}
+
+func (a *App) liveStatus(sid string) (int, []header, []byte) {
+	who := a.session(sid)
+	a.mu.Lock()
+	events := make([]map[string]string, 0, len(a.events))
+	for _, item := range a.events {
+		events = append(events, map[string]string{"type": item[0], "jti": item[1]})
+	}
+	state := a.receiverState
+	a.mu.Unlock()
+	var subject any
+	if who != nil {
+		subject = who.NameID
+	}
+	body, _ := json.Marshal(map[string]any{
+		"signedIn": who != nil,
+		"subject":  subject,
+		"receiver": state,
+		"events":   events,
+	})
+	return 200, []header{{"content-type", "application/json"}, {"cache-control", "no-store"}}, body
+}
 
 func (a *App) pending(value string, age int) string {
 	secure := a.secure
@@ -126,6 +198,9 @@ func (a *App) Handle(method, target string, headers map[string]string, body []by
 	if path == "/healthz" && method == "GET" {
 		return 200, []header{{"content-type", "text/plain"}}, []byte("ok")
 	}
+	if path == "/live-status" && method == "GET" {
+		return a.liveStatus(sid)
+	}
 	if path == "/login" && method == "GET" {
 		request, err := a.RP.Login(&wsfed.LoginOptions{RelayState: strPtr("/")})
 		if err != nil {
@@ -135,7 +210,7 @@ func (a *App) Handle(method, target string, headers map[string]string, body []by
 	}
 	if path == a.replyPath && a.RP.IsSignOutCleanup(wsfed.ReplyRequest{Method: method, URL: target}) {
 		if sid != "" {
-			delete(a.sessions, sid)
+			a.Drop(sid)
 			if a.Receiver != nil {
 				a.Receiver.Untrack(sid)
 			}
@@ -153,7 +228,9 @@ func (a *App) Handle(method, target string, headers map[string]string, body []by
 			return 400, []header{{"content-type", "text/plain"}}, []byte("Sign-in failed.")
 		}
 		sessionID := tokenURL(24)
+		a.mu.Lock()
 		a.sessions[sessionID] = who
+		a.mu.Unlock()
 		if a.Receiver != nil {
 			a.Receiver.Track(sessionID, who, nil)
 		}
@@ -169,7 +246,7 @@ func (a *App) Handle(method, target string, headers map[string]string, body []by
 	}
 	if path == "/logout" && method == "POST" {
 		if sid != "" {
-			delete(a.sessions, sid)
+			a.Drop(sid)
 			if a.Receiver != nil {
 				a.Receiver.Untrack(sid)
 			}
@@ -189,10 +266,7 @@ func (a *App) Handle(method, target string, headers map[string]string, body []by
 		return 200, []header{{"content-type", "application/samlmetadata+xml"}}, []byte(a.RP.Metadata())
 	}
 	if path == "/" && method == "GET" {
-		var who *wsfed.Login
-		if sid != "" {
-			who = a.sessions[sid]
-		}
+		who := a.session(sid)
 		page := `<p><a href="/login">Sign in with WS-Federation</a></p>`
 		if who != nil {
 			page = "<p>Signed in as <strong>" + esc(who.NameID) + "</strong> by " + esc(who.Issuer) + ".</p>" +
@@ -372,8 +446,18 @@ func Main(argv []string) int {
 			return nil, err
 		}
 		app := New(party, nil)
+		ssfBlock, _ := raw["ssf"].(map[string]any)
+		transmitterOf, _ := ssfBlock["transmitter"].(string)
+		switch {
+		case raw["signals"] == false:
+			app.SetReceiverState("not configured (signals are off)")
+		case transmitterOf == "":
+			app.SetReceiverState("not configured (no ssf block in the configuration file)")
+		case party.Config.PrivateKey == nil:
+			app.SetReceiverState("not running: the relying party has no private key")
+		}
 		if raw["signals"] != false {
-			if ssf, ok := raw["ssf"].(map[string]any); ok {
+			if ssf := ssfBlock; ssf != nil {
 				transmitter, _ := ssf["transmitter"].(string)
 				if transmitter != "" && party.Config.PrivateKey != nil {
 					interval := 5000
@@ -397,11 +481,26 @@ func Main(argv []string) int {
 						return nil
 					}, &wsfed.ReceiverOptions{TLS: tls, PollIntervalMs: interval})
 					if err != nil {
-						fmt.Printf("ssf: not started: %s\n", err.Error())
-					} else if err := receiver.Start(); err != nil {
+						app.SetReceiverState("not running: " + err.Error())
 						fmt.Printf("ssf: not started: %s\n", err.Error())
 					} else {
+						receiver.On("*", func(event *wsfed.SignalEvent) error {
+							app.Remember(event)
+							return nil
+						})
+						app.mu.Lock()
 						app.Receiver = receiver
+						app.mu.Unlock()
+						if err := receiver.Start(); err != nil {
+							app.mu.Lock()
+							app.Receiver = nil
+							app.mu.Unlock()
+							app.SetReceiverState("not running: " + err.Error())
+							fmt.Printf("ssf: not started: %s\n", err.Error())
+						} else {
+							streamID, _ := receiver.Stream()["stream_id"].(string)
+							app.SetReceiverState("polling stream " + streamID + " at " + transmitter)
+						}
 					}
 				}
 			}
