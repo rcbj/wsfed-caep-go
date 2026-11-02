@@ -17,6 +17,8 @@ The party accepts SAML 2.0 assertions with bearer confirmation `urn:oasis:names:
 
 Omitted or `true` means on. The resolved configuration leaves `SignalsSet` false in that case, which is the omitted key. `false` sets `SignalsSet` and `Signals` false. It does not start the receiver and does not require transmitter metadata. The relying party never starts the receiver itself; `SignalsReceiver` is separate. `Stop` waits until the background poll loop has finished. Sign-in does not change when signals are off, because WS-Federation does not send OAuth scopes. A non-boolean raises a config error: `signals must be true or false`. The shipped demo omits the key.
 
+**Plain http (#7).** `send` in `wsfed/httpclient.go` is the one place every fetch goes through (metadata URL, SSF configuration, JWKS, stream and poll). `refusePlainHTTP` parses with `net/url` and refuses plain `http://` to a host that is not loopback (`127.0.0.0/8`, `::1`, `localhost`) before connecting, without resolving a name, naming only the scheme and host[:port]; userinfo is never loopback, and `refuseUnsafeCharacters` refuses whitespace and control characters first. Redirects are not followed (`CheckRedirect` returns `http.ErrUseLastResponse`), so the checked URL is the only one dialled. No opt-out. `wsfed/plain_http_test.go` covers it; `http://0.0.0.0:<port>` reaches a 127.0.0.1 listener on Linux, so no accepted connection proves none was opened.
+
 ## Tests
 
 ```bash
