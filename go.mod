@@ -6,7 +6,7 @@ module github.com/rcbj/wsfed-caep-go
 go 1.27
 
 require (
-	github.com/beevik/etree v1.7.0
+	github.com/beevik/etree v1.8.1
 	github.com/russellhaering/goxmldsig v1.6.1
 )
 
