@@ -7,7 +7,7 @@ SPDX-License-Identifier: MIT
 
 Server-side WS-Federation relying party for Go. It accepts SAML 2.0 bearer assertions, reads identity-provider federation metadata, writes relying-party metadata, verifies XML signatures, decrypts encrypted assertions, and remembers assertion ids so a bearer token cannot be replayed. A Shared Signals poll receiver for CAEP and RISC is included. The relying party does not start that receiver.
 
-Version 0.1.0. License: MIT. Module `github.com/rcbj/wsfed-caep-go`, package `wsfed`. Publishing is not set up. `develop` and `main` are the same commit when this tree is published; nothing here creates a remote.
+License: MIT. Module `github.com/rcbj/wsfed-caep-go`, package `wsfed`. A release happens when the library's files changed since the last release's tag: `release.yml` takes one patch above the highest published version, publishes it, and creates the matching tag and GitHub Release. A change to tests, the demo, or the docs releases nothing. To choose a version or start a new minor, raise `VERSION`; the version is stamped in CI and is not committed, so the manifests can trail what is published. `develop` and `main` are the same commit when this tree is published; nothing here creates a remote.
 
 ## Usage
 
